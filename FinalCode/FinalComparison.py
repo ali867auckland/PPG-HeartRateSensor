@@ -49,11 +49,12 @@ ppg_bpm     = None
 polar_bpm   = None
 
 # === LIVE PLOT BUFFERS ===
-max_len     = 100\ppg_vals    = deque([0]*max_len, maxlen=max_len)
+max_len     = 100
+ppg_vals    = deque([0]*max_len, maxlen=max_len)
 polar_vals  = deque([0]*max_len, maxlen=max_len)
 diff_vals   = deque([0]*max_len, maxlen=max_len)
 
-# === LOGGING SETUP ===
+# === LOGGING SETUP ===# === LOGGING SETUP ===
 logging.basicConfig(
     level    = logging.INFO,
     format   = "%(asctime)s [%(levelname)s] %(message)s",
