@@ -127,4 +127,49 @@ class PPGReader:
                 filt_arr = filtfilt(self.b, self.a, raw_arr)
                 bpm = self.compute_bpm(np.array(self.ts_buf), filt_arr)
 
-                if
+                if bpm is not None:
+                    log.info("Current BPM: %.1f", bpm)
+                    # Publish to MQTT
+                    try:
+                        self.mqtt_client.publish(MQTT_TOPIC, f"{bpm:.1f}")
+                    except Exception as e:
+                        log.error("MQTT publish error: %s", e)
+                else:
+                    log.warning("Unable to detect BPM (not enough valid peaks)")
+
+            next_time += 1.0 / SAMPLING_RATE
+
+        self.cleanup()
+
+    def compute_bpm(self, timestamps, signal_data):
+        """
+        Envelope-based peak detection + sliding-window BPM.
+        """
+        env = np.abs(signal_data - np.mean(signal_data))
+        height = np.mean(env) + 0.5 * np.std(env)
+        min_distance = int(0.5 * SAMPLING_RATE)
+
+        peaks, _ = find_peaks(env, distance=min_distance, height=height)
+        log.debug("Envelope peaks detected: %d", len(peaks))
+
+        if len(peaks) < 8:
+            return None
+
+        peak_ts = timestamps[peaks]
+        intervals = np.diff(peak_ts)
+        return 60.0 / np.mean(intervals)
+
+    def cleanup(self):
+        """
+        Graceful cleanup on exit.
+        """
+        try:
+            self.spi.close()
+        except Exception:
+            pass
+        log.info("SPI closed. Exiting.")
+
+# === ENTRY POINT ===
+if __name__ == '__main__':
+    reader = PPGReader()
+    reader.sample_loop()
