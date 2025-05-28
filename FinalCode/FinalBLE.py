@@ -1,175 +1,134 @@
 #!/usr/bin/env python3
 """
 Industrial-grade PPG reader on Raspberry Pi Zero 2 W
-- Reads from MCP3008 ADC via SPI
-- Band-pass filters raw data (0.5–5 Hz)
-- Envelope-based, noise-robust peak detection
-- Computes BPM in sliding window with minimum peak count guard
-- Robust logging and clean shutdown
-- Publishes each BPM to an MQTT broker (Mosquitto)
+- Reads from MCP3008 over SPI
+- Band-pass filters, detects peaks, computes sliding-window BPM
+- Publishes every result to MQTT:
+    • a float string "72.4" if valid
+    • the string "invalid" if not enough peaks
 """
 
-import spidev
-import time
+import spidev, time, logging, signal, sys
 import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
-import logging
-import signal
-import sys
 from collections import deque
 
-# === MQTT setup ===
 import paho.mqtt.client as mqtt
-MQTT_BROKER = "BROKER_IP_OR_HOSTNAME"   # ← e.g. "192.168.1.42"
+
+# ─── MQTT ────────────────────────────────────────────────────────────
+MQTT_BROKER = "BROKER_IP_OR_HOSTNAME"   # e.g. "192.168.1.42"
 MQTT_PORT   = 1883
 MQTT_TOPIC  = "home/ppg/bpm"
 
-# === CONFIGURATION ===
-SPI_BUS       = 0           # SPI bus (0 or 1)
-SPI_DEVICE    = 0           # SPI device (CS0 or CS1)
-PPG_CHANNEL   = 0           # MCP3008 channel where PPG is wired
-V_REF         = 3.3         # ADC reference voltage
-ADC_RES       = 1023.0      # 10-bit MCP3008 → 0–1023
+# ─── SAMPLING & FILTER ───────────────────────────────────────────────
+SPI_BUS      = 0
+SPI_DEVICE   = 0
+PPG_CHANNEL  = 0
+ADC_RES      = 1023.0
+V_REF        = 3.3
+SAMPLING_RATE= 100  # Hz
+WINDOW_S     = 10   # seconds
+BUFFER_SIZE  = SAMPLING_RATE * WINDOW_S
 
-SAMPLING_RATE = 100         # Hz
-WINDOW_S      = 10          # seconds per BPM update
-BUFFER_SIZE   = SAMPLING_RATE * WINDOW_S
+def read_adc(spi, ch):
+    cmd  = [1, (8+ch)<<4, 0]
+    resp = spi.xfer2(cmd)
+    return ((resp[1]&3)<<8) | resp[2]
 
-# Band-pass filter design
-LOWCUT        = 0.5         # Hz
-HIGHCUT       = 5.0         # Hz
-FILTER_ORDER  = 3
+def voltage(raw):
+    return (raw/ADC_RES)*V_REF
 
-LOG_FILE      = 'ppg_bpm.log'
-
-# === SETUP LOGGING ===
-logging.basicConfig(
-    level    = logging.INFO,
-    format   = '%(asctime)s [%(levelname)s] %(message)s',
-    handlers = [
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-log = logging.getLogger('PPG')
-
-# === HELPER FUNCTIONS ===
-def make_filter(samplerate, lowcut, highcut, order=3):
-    nyq = 0.5 * samplerate
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
+def make_filter(sr, low, high, order=3):
+    nyq = 0.5*sr
+    b, a = butter(order, [low/nyq, high/nyq], btype='band')
     return b, a
 
-def read_adc(spi, channel):
-    """
-    Read raw ADC value (0–1023) from MCP3008 channel.
-    """
-    cmd = [1, (8 + channel) << 4, 0]
-    resp = spi.xfer2(cmd)
-    return ((resp[1] & 0x03) << 8) | resp[2]
+# ─── LOGGER ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    level    = logging.INFO,
+    format   = "%(asctime)s [%(levelname)s] %(message)s",
+    handlers = [logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger("PPG")
 
-def voltage_from_adc(adc_val):
-    return (adc_val / ADC_RES) * V_REF
-
-# === MAIN READER CLASS ===
 class PPGReader:
     def __init__(self):
-        # SPI setup
+        # SPI
         self.spi = spidev.SpiDev()
         self.spi.open(SPI_BUS, SPI_DEVICE)
-        self.spi.max_speed_hz = 1350000
+        self.spi.max_speed_hz = 1_350_000
 
-        # filter coefficients
-        self.b, self.a = make_filter(SAMPLING_RATE, LOWCUT, HIGHCUT, FILTER_ORDER)
+        # Filter
+        self.b, self.a = make_filter(SAMPLING_RATE, 0.5, 5.0, order=3)
 
-        # circular buffer for raw and timestamps
+        # Buffers
         self.raw_buf = deque(maxlen=BUFFER_SIZE)
         self.ts_buf  = deque(maxlen=BUFFER_SIZE)
 
-        # MQTT client
-        self.mqtt_client = mqtt.Client()
-        self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        self.mqtt_client.loop_start()
-        log.info("MQTT connected to %s:%d, topic=%s", MQTT_BROKER, MQTT_PORT, MQTT_TOPIC)
+        # MQTT
+        self.mqtt = mqtt.Client()
+        self.mqtt.connect(MQTT_BROKER, MQTT_PORT, 60)
+        self.mqtt.loop_start()
+        log.info("MQTT connected to %s:%d, topic=%s",
+                 MQTT_BROKER, MQTT_PORT, MQTT_TOPIC)
 
-        # clean shutdown on Ctrl+C
+        # Shutdown
         self.running = True
         signal.signal(signal.SIGINT, self._shutdown)
-        log.info("PPGReader initialized. Sampling at %d Hz, window=%ds.", SAMPLING_RATE, WINDOW_S)
+        log.info("PPGReader init: %d Hz, %ds window", SAMPLING_RATE, WINDOW_S)
 
-    def _shutdown(self, signum, frame):
-        log.info("Shutdown signal received, cleaning up...")
+    def _shutdown(self, sig, frame):
+        log.info("Shutdown requested")
         self.running = False
 
     def sample_loop(self):
-        """
-        Main loop: read, filter, compute BPM, log + publish.
-        """
         next_time = time.time()
         while self.running:
             now = time.time()
             if now < next_time:
-                time.sleep(next_time - now)
+                time.sleep(next_time-now)
             ts = time.time()
 
-            try:
-                raw = read_adc(self.spi, PPG_CHANNEL)
-            except Exception as e:
-                log.error("SPI read error: %s", e)
-                continue
-
-            self.raw_buf.append(raw)
+            raw = read_adc(self.spi, PPG_CHANNEL)
+            self.raw_buf.append(voltage(raw))
             self.ts_buf.append(ts)
 
-            if len(self.raw_buf) == BUFFER_SIZE:
-                raw_arr = np.array(self.raw_buf, dtype=float)
-                filt_arr = filtfilt(self.b, self.a, raw_arr)
-                bpm = self.compute_bpm(np.array(self.ts_buf), filt_arr)
+            if len(self.raw_buf)==BUFFER_SIZE:
+                sig = np.array(self.raw_buf)
+                filt = filtfilt(self.b, self.a, sig)
+                bpm = self.compute_bpm(np.array(self.ts_buf), filt)
 
                 if bpm is not None:
-                    log.info("Current BPM: %.1f", bpm)
-                    # Publish to MQTT
-                    try:
-                        self.mqtt_client.publish(MQTT_TOPIC, f"{bpm:.1f}")
-                    except Exception as e:
-                        log.error("MQTT publish error: %s", e)
+                    msg = f"{bpm:.1f}"
+                    log.info("Current BPM: %s", msg)
                 else:
-                    log.warning("Unable to detect BPM (not enough valid peaks)")
+                    msg = "invalid"
+                    log.warning("Unable to detect BPM (not enough peaks)")
 
-            next_time += 1.0 / SAMPLING_RATE
+                # publish *every* cycle
+                try:
+                    self.mqtt.publish(MQTT_TOPIC, msg)
+                except Exception as e:
+                    log.error("MQTT publish error: %s", e)
+
+            next_time += 1.0/SAMPLING_RATE
 
         self.cleanup()
 
     def compute_bpm(self, timestamps, signal_data):
-        """
-        Envelope-based peak detection + sliding-window BPM.
-        """
         env = np.abs(signal_data - np.mean(signal_data))
-        height = np.mean(env) + 0.5 * np.std(env)
-        min_distance = int(0.5 * SAMPLING_RATE)
-
-        peaks, _ = find_peaks(env, distance=min_distance, height=height)
-        log.debug("Envelope peaks detected: %d", len(peaks))
-
-        if len(peaks) < 8:
+        thresh = np.mean(env) + 0.5*np.std(env)
+        min_d   = int(0.5*SAMPLING_RATE)
+        peaks, _ = find_peaks(env, distance=min_d, height=thresh)
+        if len(peaks)<8:
             return None
-
-        peak_ts = timestamps[peaks]
-        intervals = np.diff(peak_ts)
-        return 60.0 / np.mean(intervals)
+        intervals = np.diff(timestamps[peaks])
+        return 60.0/np.mean(intervals)
 
     def cleanup(self):
-        """
-        Graceful cleanup on exit.
-        """
-        try:
-            self.spi.close()
-        except Exception:
-            pass
-        log.info("SPI closed. Exiting.")
+        try: self.spi.close()
+        except: pass
+        log.info("SPI closed, exiting")
 
-# === ENTRY POINT ===
-if __name__ == '__main__':
-    reader = PPGReader()
-    reader.sample_loop()
+if __name__=='__main__':
+    PPGReader().sample_loop()
