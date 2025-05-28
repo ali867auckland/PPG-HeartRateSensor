@@ -247,5 +247,9 @@ if __name__ == '__main__':
     plt.tight_layout()
     plt.show()
 
-    # stop threads on window close
+    # signal threads to stop
     reader.running = False
+    # give processor thread time to finish and write summary
+    time.sleep(1)
+    # ensure cleanup writes CSV summary
+    reader.cleanup()
