@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Unified PPG + Polar H10 comparison with decoupled sampling and throttled BPM updates
-- Dedicated sampler thread reads MCP3008 at 100 Hz into a queue
-- Processor thread filters 10 s windows, detects peaks, computes sliding-window BPM once per second
+Unified PPG + Polar H10 comparison with decoupled sampling and CSV summary
+- Dedicated sampler thread reads MCP3008 at 100 Hz into a queue
+- Processor thread filters 10 s windows, detects peaks, computes sliding-window BPM
 - Polar H10 BLE client in separate thread
 - Live plotting of PPG BPM, Polar BPM, and difference
 - CSV + console logging; post-run summary of mean difference vs. difference of means stored in CSV
@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("PPG_Plot")
 
-# === HELPER FUNCTIONS ===
+# === HELPERS ===
 def make_filter(fs, low, high, order):
     nyq = 0.5 * fs
     return butter(order, [low/nyq, high/nyq], btype='band')
@@ -74,7 +74,7 @@ class PPGPolarPlot:
         # SPI setup for sampler
         self.spi = spidev.SpiDev()
         self.spi.open(SPI_BUS, SPI_DEVICE)
-        self.spi.max_speed_hz = 1350000
+        self.spi.max_speed_hz = 1_350_000
         # filter design for processor
         self.b, self.a = make_filter(FS, LOWCUT, HIGHCUT, FILTER_ORDER)
 
@@ -84,9 +84,6 @@ class PPGPolarPlot:
 
         # queue to decouple sampling
         self.sample_q = queue.Queue()
-
-        # throttle counter for compute (~once per second)
-        self.compute_counter = 0
 
         # history for summary
         self.diff_history  = []
@@ -124,7 +121,7 @@ class PPGPolarPlot:
             next_t += 1.0 / FS
 
     def processor_thread(self):
-        """Consumes samples, runs filter + BPM compute throttled to once per second."""
+        """Consumes samples, runs filter + BPM compute once per full window."""
         global ppg_bpm
         while self.running or not self.sample_q.empty():
             try:
@@ -135,12 +132,6 @@ class PPGPolarPlot:
             self.ts_buf.append(ts)
 
             if len(self.raw_buf) == BUFFER_SIZE:
-                self.compute_counter += 1
-                # throttle: compute on first full window and then once per second
-                if self.compute_counter != 1 and (self.compute_counter % FS) != 0:
-                    continue
-
-                # filter & compute BPM
                 raw_arr  = np.array(self.raw_buf, float)
                 filt_arr = filtfilt(self.b, self.a, raw_arr)
                 bpm = self.compute_bpm(np.array(self.ts_buf), filt_arr)
@@ -172,8 +163,8 @@ class PPGPolarPlot:
 
     def compute_bpm(self, timestamps, signal_data):
         """Envelope-based peak detection identical to standalone 10 s reader."""
-        env = np.abs(signal_data - np.mean(signal_data))
-        height = np.mean(env) + 0.5 * np.std(env)
+        env      = np.abs(signal_data - np.mean(signal_data))
+        height   = np.mean(env) + 0.5 * np.std(env)
         min_dist = int(0.5 * FS)
         peaks, _ = find_peaks(env, distance=min_dist, height=height)
         log.debug(f"Envelope peaks: {len(peaks)}")
@@ -205,16 +196,17 @@ class PPGPolarPlot:
     def cleanup(self):
         # summary
         if self.diff_history:
-            avg_diff    = sum(self.diff_history) / len(self.diff_history)
-            avg_ppg     = sum(self.ppg_history) / len(self.ppg_history)
-            avg_pol     = sum(self.polar_history) / len(self.polar_history)
-            diff_of_avgs= abs(avg_ppg - avg_pol)
+            avg_diff     = sum(self.diff_history) / len(self.diff_history)
+            avg_ppg      = sum(self.ppg_history)   / len(self.ppg_history)
+            avg_pol      = sum(self.polar_history) / len(self.polar_history)
+            diff_of_avgs = abs(avg_ppg - avg_pol)
             log.info(f"Average of instantaneous differences: {avg_diff:.2f} BPM")
-            log.info(f"Difference of overall averages: {diff_of_avgs:.2f} BPM")
+            log.info(f"Difference of overall averages:   {diff_of_avgs:.2f} BPM")
             # write summary into CSV
             self.csv_w.writerow([])
             self.csv_w.writerow(['Average of instantaneous differences', f"{avg_diff:.2f}"])
             self.csv_w.writerow(['Difference of overall averages',    f"{diff_of_avgs:.2f}"])
+
         try: self.spi.close()
         except: pass
         try: self.csv_f.close()
@@ -245,7 +237,7 @@ if __name__ == '__main__':
     fig, ax = plt.subplots()
     line_ppg, = ax.plot([], [], label='PPG BPM')
     line_pol, = ax.plot([], [], label='Polar BPM')
-    line_diff, = ax.plot([], [], label='Difference')
+    line_diff,= ax.plot([], [], label='Difference')
     ax.set_xlabel('Sample Index')
     ax.set_ylabel('BPM')
     ax.set_title('Live PPG vs. Polar H10 BPM')
@@ -255,4 +247,5 @@ if __name__ == '__main__':
     plt.tight_layout()
     plt.show()
 
+    # stop threads on window close
     reader.running = False
